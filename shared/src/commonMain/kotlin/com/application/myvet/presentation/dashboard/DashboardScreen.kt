@@ -53,7 +53,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.application.myvet.data.network.AppointmentDto
+import com.application.myvet.data.network.InvitationDto
 import com.application.myvet.data.network.MyVetApi
+import com.application.myvet.data.network.PatientDto
 import com.application.myvet.data.network.PetDto
 import com.application.myvet.data.network.VeterinarianDto
 import kotlinx.coroutines.launch
@@ -79,14 +81,15 @@ private data class Veterinarian(val id: Int, val name: String, val specialty: St
 
 private fun VeterinarianDto.toUiVeterinarian() = Veterinarian(id, name, "Veterinaria")
 
-private fun AppointmentDto.toUiAppointment(pets: List<PetDto>, veterinarians: List<VeterinarianDto>): Appointment {
+private fun AppointmentDto.toUiAppointment(pets: List<PetDto>, veterinarians: List<VeterinarianDto>, patients: List<PatientDto> = emptyList()): Appointment {
     val pet = pets.firstOrNull { it.id == pet_id }
+    val patient = patients.firstOrNull { it.id == pet_id }
     val veterinarian = veterinarians.firstOrNull { it.id == veterinarian_id }
     return Appointment(
         id = id,
-        petName = pet?.name ?: "Paciente #$pet_id",
-        species = pet?.species ?: "Paciente",
-        ownerName = "Propietario",
+        petName = pet?.name ?: patient?.name ?: "Paciente #$pet_id",
+        species = pet?.species ?: patient?.species ?: "Paciente",
+        ownerName = patient?.owner_name ?: "Propietario",
         date = appointment_date,
         time = appointment_time,
         reason = reason,
@@ -116,6 +119,7 @@ fun DashboardScreen() {
     val appointments = remember { mutableStateListOf<Appointment>() }
     val veterinarians = remember { mutableStateListOf<Veterinarian>() }
     val pets = remember { mutableStateListOf<PetDto>() }
+    val patients = remember { mutableStateListOf<PatientDto>() }
     var role by remember { mutableStateOf(AppRole.OWNER) }
     var destination by remember { mutableStateOf(DrawerDestination.HOME) }
     var screen by remember { mutableStateOf(AppScreen.HOME) }
@@ -126,16 +130,28 @@ fun DashboardScreen() {
     suspend fun refreshAgenda() {
         loading = true
         networkError = null
+        var step = "login"
         runCatching {
             val credentials = if (role == AppRole.OWNER) "owner@myvet.test" to "owner123" else "vet@myvet.test" to "vet123"
             val session = api.login(credentials.first, credentials.second)
             sessionToken = session.token
+            step = "mascotas"
             val apiPets = if (role == AppRole.OWNER) api.pets(session.token) else emptyList()
+            step = "veterinarios"
             val apiVeterinarians = if (role == AppRole.OWNER) api.veterinarians(session.token) else emptyList()
+            step = "pacientes"
+            val apiPatients = if (role == AppRole.VETERINARIAN) api.patients(session.token) else emptyList()
             pets.clear(); pets.addAll(apiPets)
+            patients.clear(); patients.addAll(apiPatients)
             veterinarians.clear(); veterinarians.addAll(apiVeterinarians.map { it.toUiVeterinarian() })
-            appointments.clear(); appointments.addAll(api.appointments(session.token).map { it.toUiAppointment(apiPets, apiVeterinarians) })
-        }.onFailure { networkError = "No pudimos conectar con la API. Verificá que XAMPP esté activo." }
+            step = "turnos"
+            appointments.clear(); appointments.addAll(api.appointments(session.token).map { it.toUiAppointment(apiPets, apiVeterinarians, apiPatients) })
+        }.onFailure {
+            // Diagnóstico: indica en qué paso falló, qué URL usa la app y el tipo de error (y su causa).
+            networkError = "Falló el paso \"$step\" en ${com.application.myvet.data.network.ApiConfig.baseUrl}. " +
+                    "${it::class.simpleName}: ${it.message ?: "sin mensaje"}" +
+                    (it.cause?.let { cause -> " | causa: ${cause::class.simpleName}: ${cause.message}" } ?: "")
+        }
         loading = false
     }
     LaunchedEffect(role) { refreshAgenda() }
@@ -197,13 +213,19 @@ fun DashboardScreen() {
             when (destination) {
                 DrawerDestination.HOME -> HomeContent(appointments, role, loading, networkError, { screen = AppScreen.CREATE_CONSULTATION }, Modifier.padding(padding))
                 DrawerDestination.PETS -> if (role == AppRole.OWNER) {
-                    PlaceholderContent("Mis mascotas", "Encontrá fichas, antecedentes y próximos controles de cada paciente.", "🐾", Modifier.padding(padding))
+                    PetsContent(pets, loading, networkError, Modifier.padding(padding))
                 } else {
-                    PatientsContent(Modifier.padding(padding))
+                    PatientsContent(patients, loading, networkError, Modifier.padding(padding))
                 }
                 DrawerDestination.CONSULTATIONS -> PlaceholderContent("Mis consultas", "Próximamente: filtros para pendientes, aprobadas, efectuadas y canceladas.", "▤", Modifier.padding(padding))
-                DrawerDestination.VETERINARIANS -> VeterinariansContent(veterinarians, Modifier.padding(padding))
-                DrawerDestination.INVITATIONS -> InvitationContent(Modifier.padding(padding))
+                DrawerDestination.VETERINARIANS -> VeterinariansContent(
+                    veterinarians = veterinarians,
+                    api = api,
+                    token = sessionToken,
+                    onLinked = { scope.launch { refreshAgenda() } },
+                    modifier = Modifier.padding(padding),
+                )
+                DrawerDestination.INVITATIONS -> InvitationContent(api, sessionToken, Modifier.padding(padding))
             }
         }
     }
@@ -231,11 +253,11 @@ private fun NextAppointmentCard(appointment: Appointment?, role: AppRole) {
         if (appointment == null) Text("No hay turnos reservados para hoy.", Modifier.padding(24.dp)) else Column(Modifier.padding(24.dp)) {
             Text(if (role == AppRole.OWNER) "PRÓXIMO TURNO" else "PRÓXIMO PACIENTE", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(12.dp)); Row(verticalAlignment = Alignment.CenterVertically) {
-                PetAvatar(appointment); Spacer(Modifier.width(14.dp)); Column(Modifier.weight(1f)) {
-                    Text(appointment.petName, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
-                    Text(if (role == AppRole.OWNER) appointment.veterinarian else appointment.ownerName, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                }; Text(appointment.time, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-            }
+            PetAvatar(appointment); Spacer(Modifier.width(14.dp)); Column(Modifier.weight(1f)) {
+            Text(appointment.petName, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+            Text(if (role == AppRole.OWNER) appointment.veterinarian else appointment.ownerName, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }; Text(appointment.time, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+        }
             Spacer(Modifier.height(14.dp)); Surface(color = MaterialTheme.colorScheme.background.copy(alpha = 0.6f), shape = RoundedCornerShape(10.dp)) { Text(appointment.reason, Modifier.padding(horizontal = 12.dp, vertical = 7.dp), style = MaterialTheme.typography.labelLarge) }
         }
     }
@@ -246,9 +268,9 @@ private fun AppointmentRow(appointment: Appointment, role: AppRole) {
     Card(shape = RoundedCornerShape(18.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
         Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
             PetAvatar(appointment); Spacer(Modifier.width(12.dp)); Column(Modifier.weight(1f)) {
-                Text(appointment.petName, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                Text(if (role == AppRole.OWNER) "${appointment.reason} · ${appointment.veterinarian}" else "${appointment.reason} · ${appointment.ownerName}", color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            }; Text(appointment.time, fontWeight = FontWeight.Bold)
+            Text(appointment.petName, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            Text(if (role == AppRole.OWNER) "${appointment.reason} · ${appointment.veterinarian}" else "${appointment.reason} · ${appointment.ownerName}", color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }; Text(appointment.time, fontWeight = FontWeight.Bold)
         }
     }
 }
@@ -328,32 +350,22 @@ private fun CreateConsultationScreen(
 }
 
 @Composable
-private fun VeterinariansContent(veterinarians: List<Veterinarian>, modifier: Modifier) {
-    Column(modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-        Text("Mis veterinarios", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
-        veterinarians.forEach { veterinarian ->
-            Card { Column(Modifier.padding(18.dp)) { Text(veterinarian.name, fontWeight = FontWeight.Bold); Text(veterinarian.specialty, color = MaterialTheme.colorScheme.primary); Text("Agregado a tu lista") } }
-        }
-        Text("Los códigos de invitación son privados, de un solo uso y no se muestran en tu agenda. Al reservar, elegís directamente un profesional de esta lista.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-    }
-}
-
-@Composable
-private fun PatientsContent(modifier: Modifier) {
-    val patients = listOf(
-        Triple("Milo", "Sofía Gómez", "4 años"),
-        Triple("Luna", "Martín Pérez", "2 años"),
-        Triple("Simón", "Lucía Fernández", "6 años"),
-    )
+private fun PetsContent(pets: List<PetDto>, loading: Boolean, networkError: String?, modifier: Modifier) {
     LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        item { Text("Mis pacientes", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold) }
-        item { Text("Accedé a sus próximas consultas e historial clínico.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
-        items(patients) { (name, owner, age) ->
+        item { Text("Mis mascotas", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold) }
+        if (loading) item { Text("Cargando mascotas...") }
+        networkError?.let { message -> item { Text(message, color = MaterialTheme.colorScheme.error) } }
+        if (!loading && networkError == null && pets.isEmpty()) item { Text("Todavía no registraste mascotas.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
+        items(pets) { pet ->
             Card(shape = RoundedCornerShape(18.dp)) {
                 Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
                     Box(Modifier.size(48.dp).background(Color(0xFFDCE8F7), CircleShape), contentAlignment = Alignment.Center) { Text("🐾") }
                     Spacer(Modifier.width(12.dp))
-                    Column { Text(name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold); Text("Propietario: $owner", color = MaterialTheme.colorScheme.onSurfaceVariant); Text(age, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium) }
+                    Column {
+                        Text(pet.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                        Text(listOfNotNull(pet.species, pet.breed).joinToString(" · "), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("Nacimiento: ${pet.birth_date}", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium)
+                    }
                 }
             }
         }
@@ -361,22 +373,119 @@ private fun PatientsContent(modifier: Modifier) {
 }
 
 @Composable
-private fun InvitationContent(modifier: Modifier) {
-    var invitationCode by remember { mutableStateOf<String?>(null) }
-    Column(modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-        Text("Invitaciones", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
-        Text("Generá un código de un solo uso para que un propietario te agregue a su lista de veterinarios.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-        if (invitationCode == null) {
-            Button(onClick = { invitationCode = "INV-8M2Q" }, modifier = Modifier.fillMaxWidth().height(52.dp), shape = RoundedCornerShape(16.dp)) { Text("Generar invitación") }
-        } else {
-            Card(shape = RoundedCornerShape(18.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)) {
-                Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("Código activo", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
-                    Text(invitationCode!!, style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
-                    Text("Compartilo personalmente. Cuando el propietario lo canjee, dejará de ser válido.")
+private fun VeterinariansContent(veterinarians: List<Veterinarian>, api: MyVetApi, token: String?, onLinked: () -> Unit, modifier: Modifier) {
+    val scope = rememberCoroutineScope()
+    var code by remember { mutableStateOf("") }
+    var redeeming by remember { mutableStateOf(false) }
+    var message by remember { mutableStateOf<String?>(null) }
+    var messageIsError by remember { mutableStateOf(false) }
+    LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        item { Text("Mis veterinarios", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold) }
+        if (veterinarians.isEmpty()) item { Text("Todavía no agregaste veterinarios. Pedile un código de invitación a tu veterinario y canjealo más abajo.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
+        items(veterinarians) { veterinarian ->
+            Card { Column(Modifier.padding(18.dp)) { Text(veterinarian.name, fontWeight = FontWeight.Bold); Text(veterinarian.specialty, color = MaterialTheme.colorScheme.primary); Text("Agregado a tu lista") } }
+        }
+        item { Text("Agregar con código", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold) }
+        item {
+            OutlinedTextField(
+                value = code,
+                onValueChange = { code = it.uppercase(); message = null },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Código de invitación (INV-XXXXXX)") },
+                singleLine = true,
+            )
+        }
+        message?.let { text -> item { Text(text, color = if (messageIsError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary) } }
+        item {
+            Button(
+                onClick = {
+                    scope.launch {
+                        redeeming = true
+                        message = null
+                        runCatching { api.redeemInvitation(token!!, code) }
+                            .onSuccess { messageIsError = false; message = "Veterinario agregado a tu lista."; code = ""; onLinked() }
+                            .onFailure { messageIsError = true; message = it.message ?: "No se pudo canjear el código." }
+                        redeeming = false
+                    }
+                },
+                enabled = token != null && code.isNotBlank() && !redeeming,
+                modifier = Modifier.fillMaxWidth().height(52.dp),
+                shape = RoundedCornerShape(16.dp),
+            ) { Text(if (redeeming) "Canjeando..." else "Agregar veterinario") }
+        }
+        item { Text("Los códigos son privados y de un solo uso. Al reservar, elegís directamente un profesional de esta lista.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
+    }
+}
+
+@Composable
+private fun PatientsContent(patients: List<PatientDto>, loading: Boolean, networkError: String?, modifier: Modifier) {
+    LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        item { Text("Mis pacientes", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold) }
+        item { Text("Mascotas que tienen o tuvieron consultas con vos.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
+        if (loading) item { Text("Cargando pacientes...") }
+        networkError?.let { message -> item { Text(message, color = MaterialTheme.colorScheme.error) } }
+        if (!loading && networkError == null && patients.isEmpty()) item { Text("Todavía no tenés pacientes.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
+        items(patients) { patient ->
+            Card(shape = RoundedCornerShape(18.dp)) {
+                Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Box(Modifier.size(48.dp).background(Color(0xFFDCE8F7), CircleShape), contentAlignment = Alignment.Center) { Text("🐾") }
+                    Spacer(Modifier.width(12.dp))
+                    Column {
+                        Text(patient.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                        Text("Propietario: ${patient.owner_name}", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("${patient.species} · ${patient.age}", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium)
+                    }
                 }
             }
-            OutlinedButton(onClick = { invitationCode = null }, modifier = Modifier.fillMaxWidth()) { Text("Invalidar invitación") }
+        }
+    }
+}
+
+@Composable
+private fun InvitationContent(api: MyVetApi, token: String?, modifier: Modifier) {
+    val scope = rememberCoroutineScope()
+    val invitations = remember { mutableStateListOf<InvitationDto>() }
+    var working by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+
+    suspend fun loadInvitations() {
+        if (token == null) return
+        runCatching { api.invitations(token) }
+            .onSuccess { invitations.clear(); invitations.addAll(it.reversed()) }
+            .onFailure { error = "No pudimos cargar tus invitaciones: ${it.message ?: it::class.simpleName}" }
+    }
+    LaunchedEffect(token) { loadInvitations() }
+
+    LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        item { Text("Invitaciones", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold) }
+        item { Text("Generá un código de un solo uso para que un propietario te agregue a su lista de veterinarios.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
+        error?.let { message -> item { Text(message, color = MaterialTheme.colorScheme.error) } }
+        item {
+            Button(
+                onClick = {
+                    scope.launch {
+                        working = true
+                        error = null
+                        runCatching { api.createInvitation(token!!) }
+                            .onSuccess { loadInvitations() }
+                            .onFailure { error = "No pudimos generar la invitación: ${it.message ?: it::class.simpleName}" }
+                        working = false
+                    }
+                },
+                enabled = token != null && !working,
+                modifier = Modifier.fillMaxWidth().height(52.dp),
+                shape = RoundedCornerShape(16.dp),
+            ) { Text(if (working) "Generando..." else "Generar invitación") }
+        }
+        items(invitations) { invitation ->
+            val active = invitation.status == "active"
+            Card(shape = RoundedCornerShape(18.dp), colors = CardDefaults.cardColors(containerColor = if (active) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant)) {
+                Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(if (active) "Código activo" else "Código usado", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
+                    Text(invitation.code, style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+                    if (active) Text("Compartilo personalmente. Cuando el propietario lo canjee, dejará de ser válido.")
+                }
+            }
         }
     }
 }
